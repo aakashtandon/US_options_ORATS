@@ -2,6 +2,8 @@
 
 import pandas as pd
 
+from typing import List
+
 
 import pandas as pd
 import pandas_market_calendars as mcal
@@ -76,7 +78,20 @@ def find_missing_data_days(con, ticker, path_template, start_date_str, end_date_
 # # This will connect to your S3 and check each day in the range.
 # missing_dates = find_missing_data_days(con, 'SPY', path_template, start_date, end_date)
 
+import numpy as np
 
+def round_to_nearest(number, interval=1):
+    """
+    Rounds a number to the nearest specified interval.
+
+    Args:
+        number (float or np.ndarray): The number or array of numbers to round.
+        interval (float): The interval to round to (e.g., 1, 0.5, 5).
+
+    Returns:
+        float or np.ndarray: The rounded number or array.
+    """
+    return interval * np.round(number / interval)
 
 
 
@@ -187,8 +202,8 @@ def fetch_single_option_all_day(con, ticker, date_str, strike, expiry_str, optio
 #     print(single_option_df.head())
 
 
-
 def fetch_single_option_at_timestamp(con, ticker, timestamp, strike, expiry_str, option_type , DTE=1):
+    
     """
     Fetches data for a single, specific option contract at a single timestamp.
 
@@ -202,7 +217,9 @@ def fetch_single_option_at_timestamp(con, ticker, timestamp, strike, expiry_str,
 
     Returns:
         pd.DataFrame: A DataFrame with a single row of data, or an empty DataFrame.
+
     """
+
     try:
         # Convert the local timestamp to UTC for the query
         utc_timestamp_str = timestamp.tz_localize('America/New_York').tz_convert('UTC').strftime('%Y-%m-%d %H:%M:%S')
@@ -210,13 +227,13 @@ def fetch_single_option_at_timestamp(con, ticker, timestamp, strike, expiry_str,
 
         query = f"""
             SELECT 
-                ts, strike, expiry, dte, optionType, volume, oi,
+                ts, strike, expiry, dte, optionType, volume, oi,close,
                 bidPrice, askPrice, bidIv, askIv, iv, stockPrice, ticker
             FROM read_parquet('s3://duckdata/ORATS/Options/ticker={ticker}/day={date_str}/*.parquet')
             WHERE 
                 ts = '{utc_timestamp_str}' AND
                 strike = {strike} AND
-                dte={DTE}
+                dte={DTE} AND
                 expiry = '{expiry_str}' AND
                 optionType = {option_type};
         """
@@ -298,6 +315,55 @@ def find_straddle_at_timestamp(con, ticker, timestamp, expiry_str, underlying_pr
 
     except Exception as e:
         print(f"An error occurred: {e}")
+        return pd.DataFrame()
+
+
+
+def fetch_bulk_option_data(con, ticker, end_date_str, n_days, strikes: List[float], expiries: List[str], option_type):
+    
+    """
+    Fetches a range of minute-level data for MULTIPLE option contracts
+    in a single, efficient query.
+    """
+    # 1. Get the list of business days to query (same as before)
+    nyse = mcal.get_calendar('NYSE')
+    start_buffer = pd.to_datetime(end_date_str) - pd.Timedelta(days=n_days)
+    schedule = nyse.schedule(start_date=start_buffer, end_date=end_date_str)
+    business_day_list = [d.strftime('%Y-%m-%d') for d in schedule.index[-n_days:]]
+    
+    # 2. Build the list of S3 paths (same as before)
+    path_list = [
+        f"'s3://duckdata/ORATS/Options/ticker={ticker}/day={d}/*.parquet'"
+        for d in business_day_list ]
+    
+    # ▼▼▼ NEW QUERY LOGIC ▼▼▼
+    # 3. Format the lists for the SQL 'IN' clause
+    strikes_str = ",".join(map(str, strikes)) # For numbers: 470.0,471.0,472.0
+    expiries_str = ",".join([f"'{e}'" for e in expiries]) # For strings: '2024-01-05','2024-01-08'
+    
+    query = f"""
+        SELECT ts, strike, expiry, close, bidPrice, askPrice, volume, oi, dte, optionType , iv
+        FROM read_parquet([{",".join(path_list)}])
+        WHERE 
+            CAST(strike AS FLOAT) IN ({strikes_str}) AND
+            expiry IN ({expiries_str}) AND
+            optionType = {option_type}
+        ORDER BY ts;
+    """
+    
+    try:
+        bulk_df = con.execute(query).df()
+        
+        if bulk_df.empty:
+            return pd.DataFrame()
+            
+        # Perform timezone conversion and set index (same as before)
+        bulk_df['ts'] = pd.to_datetime(bulk_df['ts'].dt.tz_localize('UTC').dt.tz_convert('America/New_York').dt.tz_localize(None))
+        bulk_df.set_index('ts' , inplace=True)
+        return bulk_df
+        
+    except Exception as e:
+        print(f"An error occurred during bulk fetch: {e}")
         return pd.DataFrame()
 
 
@@ -428,3 +494,70 @@ def fetch_option_data_for_n_days(con, ticker, end_date_str, n_days, strike, expi
 #     print("\n--- Found Data for Date Range ---")
 #     print(multi_day_df)
 
+
+
+
+
+def fetch_market_data_for_range(con, ticker, start_date, end_date, start_time, end_time, option_type=1):
+    """
+    Generates minute-by-minute timestamps for a date range and fetches market data for each one.
+
+    Args:
+        con: The database connection object.
+        ticker (str): The ticker symbol to fetch.
+        start_date (str): The start date in 'YYYY-MM-DD' format.
+        end_date (str): The end date in 'YYYY-MM-DD' format.
+        start_time (datetime.time): The start time for the daily filter.
+        end_time (datetime.time): The end time for the daily filter.
+        option_type (int): The option type to fetch (e.g., 1 for Call).
+
+    Returns:
+        Tuple[pd.DataFrame, List]: A tuple containing:
+            - A DataFrame of successfully fetched stock prices.
+            - A list of timestamps for which data fetching failed.
+    """
+    # --- Step 1: Generate All Trading Timestamps ---
+    nyse = mcal.get_calendar('NYSE')
+    schedule = nyse.schedule(start_date=start_date, end_date=end_date)
+    
+    list_of_daily_timestamps = [
+        pd.date_range(start=day.market_open, end=day.market_close, freq='1min') 
+        for _, day in schedule.iterrows()
+    ]
+    all_trading_minutes = pd.DatetimeIndex([]).append(list_of_daily_timestamps)
+
+    # --- Step 2: Filter Timestamps to the Desired Window ---
+    mask = (all_trading_minutes.tz_convert('America/New_York').time >= start_time) & \
+           (all_trading_minutes.tz_convert('America/New_York').time <= end_time)
+    filtered_utc_minutes = all_trading_minutes[mask]
+
+    # --- Step 3: Loop and Fetch Data ---
+    successful_results = []
+    failed_timestamps = set()
+    
+    for ts in filtered_utc_minutes:
+        atm_call_data = fetch_atm_option_at_timestamp(
+            con=con,
+            ticker=ticker,
+            timestamp=ts,
+            option_type=option_type
+        )
+        
+        if not atm_call_data.empty:
+            successful_results.append({
+                'timestamp': atm_call_data.iloc[0]['ts'],
+                'stockPrice': atm_call_data.iloc[0]['stockPrice']
+            })
+        else:
+            failed_timestamps.add(ts)
+
+    # --- Step 4: Process and Return Results ---
+    if successful_results:
+        results_df = pd.DataFrame(successful_results)
+        # Convert timestamp column, handle timezone, and set as index
+        results_df['timestamp'] = pd.to_datetime(results_df['timestamp']).dt.tz_convert('America/New_York').dt.tz_localize(None)
+        results_df.set_index('timestamp', inplace=True)
+    else:
+        results_df = pd.DataFrame()
+        
+    return results_df, sorted(list(failed_timestamps))
